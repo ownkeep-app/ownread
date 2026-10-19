@@ -310,7 +310,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          lib.loading ? '本地阅读' : '本地阅读 · 共 ${lib.totalCount} 本',
+          lib.loading ? '私人阅读' : '私人阅读 · 共 ${lib.totalCount} 本',
         ),
         actions: [
           PopupMenuButton<NovelSortBy>(

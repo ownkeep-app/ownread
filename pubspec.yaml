@@ -1,5 +1,5 @@
 name: ownread
-description: 本地阅读 — offline TXT novel reader for Android and macOS.
+description: 私人阅读 — offline TXT novel reader for Android and macOS.
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -44,5 +44,5 @@ flutter_launcher_icons:
   macos:
     generate: true
   image_path: assets/icon/app_icon.png
-  adaptive_icon_background: "#E07A3D"
+  adaptive_icon_background: "#FFFFFF"
   adaptive_icon_foreground: assets/icon/app_icon.png

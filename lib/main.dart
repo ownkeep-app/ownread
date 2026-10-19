@@ -50,7 +50,7 @@ class OwnReadApp extends StatelessWidget {
       builder: (context, _) {
         final dark = settings.reading.darkMode;
         return ShadApp(
-          title: '本地阅读',
+          title: '私人阅读',
           debugShowCheckedModeBanner: false,
           theme: buildOwnReadLightTheme(),
           darkTheme: buildOwnReadDarkTheme(),

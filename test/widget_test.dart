@@ -24,6 +24,7 @@ void main() {
         theme: buildOwnReadLightTheme(),
         home: Scaffold(
           body: NovelListTile(
+            index: 0,
             novel: novel,
             onOpen: () {},
             onRename: () {},

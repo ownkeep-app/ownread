@@ -15,7 +15,21 @@ import '../../../core/theme/app_theme.dart';
 import '../widgets/find_replace_dialog.dart';
 import '../widgets/reader_chrome.dart';
 
-/// Infinite-scroll chapter reader with lazy load + prev/next prefetch.
+/// Where the reader is inside a chapter, independent of scroll offsets.
+typedef ReadingAnchor = ({int chapter, double fraction});
+
+/// Infinite-scroll chapter reader.
+///
+/// Layout invariant (keeps the reading position stable):
+/// the list is a [CustomScrollView] whose `center` sliver starts at the
+/// *anchor* chapter (scroll offset 0). Later chapters are appended to the
+/// forward sliver, earlier chapters to the backward sliver above the center.
+/// Only chapters whose text is already loaded are ever inserted, and they are
+/// only inserted at the far ends, so loading never moves what is on screen and
+/// no scroll offset ever has to be compensated.
+///
+/// Anything that changes the height of already-inserted chapters (font
+/// settings, width, replace, edit) restores position via [ReadingAnchor].
 class ReaderScreen extends StatefulWidget {
   const ReaderScreen({
     super.key,
@@ -35,7 +49,10 @@ class ReaderScreen extends StatefulWidget {
 class _ReaderScreenState extends State<ReaderScreen> {
   final _scroll = ScrollController();
   final _chapterCache = <int, String>{};
-  final _loading = <int>{};
+
+  /// Bumped whenever a chapter's text is replaced, so in-flight loads that
+  /// read the old file are discarded.
+  final _chapterRevision = <int, int>{};
 
   NovelMeta? _meta;
   ChapterIndex _index = const ChapterIndex([]);
@@ -51,22 +68,37 @@ class _ReaderScreenState extends State<ReaderScreen> {
   final _readerFocus = FocusNode(debugLabel: 'reader');
   Offset? _doubleTapGlobal;
 
-  /// Window of chapter indices currently mounted in the list.
-  int _windowStart = 0;
-  int _windowEnd = 0;
-  /// True while adjusting the window (prepend/trim); blocks re-entrant scroll logic.
-  bool _windowBusy = false;
-  /// Layout keys for precise jump / visible-chapter detection.
+  /// First chapter of the center (forward) sliver; sits at scroll offset 0.
+  int _anchorChapter = 0;
+
+  /// Loaded chapters mounted in the list: `[_firstLoaded, _endLoaded)`.
+  int _firstLoaded = 0;
+  int _endLoaded = 0;
+
+  /// Identity of the current list layout. Changing it recreates the slivers.
+  int _listGen = 0;
+
+  /// Invalidates async work started for an older anchor.
+  int _anchorToken = 0;
+  bool _extendingForward = false;
+  bool _extendingBackward = false;
+
+  /// Layout keys for measuring chapters (visible-chapter detection, restore).
   final Map<int, GlobalKey> _chapterKeys = {};
+
   /// Keys on chapter body [Text] for caret hit-testing.
   final Map<int, GlobalKey> _chapterBodyKeys = {};
 
-  /// True while a chapter jump is in progress (blocks prepend/trim races).
-  bool _jumping = false;
+  /// Last known reading position; used to restore after a width change.
+  ReadingAnchor? _lastAnchor;
+  double? _lastListWidth;
+
   /// Reader list offset captured when entering edit (Android restore fallback).
   double? _readerOffsetBeforeEdit;
+
   /// True while restoring scroll after leaving the editor.
   bool _restoringAfterEdit = false;
+
   /// Target offset for in-flight arrow-key smooth scrolling.
   double? _arrowScrollTarget;
 
@@ -90,6 +122,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void dispose() {
     _replaceGen++;
+    _anchorToken++;
     settings.removeListener(_onSettings);
     _progressSaveTimer?.cancel();
     _scroll.removeListener(_onScroll);
@@ -103,7 +136,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   void _onSettings() {
     if (!mounted) return;
-    setState(() => _reading = settings.reading);
+    final next = settings.reading;
+    if (next == _reading) return;
+    final anchor = _captureAnchor();
+    setState(() => _reading = next);
+    if (anchor != null) unawaited(_restoreAnchor(anchor));
   }
 
   Future<void> _bootstrap() async {
@@ -123,20 +160,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
           meta.progressChapterIndex.clamp(0, mathMax0(index.length - 1));
       _meta = meta;
       _index = index;
-      await _prepareWindowAt(start);
+      await _anchorAt(start, fractionInChapter: meta.progressFractionInChapter);
       if (!mounted) return;
-      setState(() => _booting = false);
+      if (_booting) setState(() => _booting = false);
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _readerFocus.requestFocus();
-        unawaited(
-          _scrollToChapterInWindow(
-            start,
-            fractionInChapter: meta.progressFractionInChapter,
-          ),
-        );
+        if (mounted) _readerFocus.requestFocus();
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
         _booting = false;
@@ -144,117 +175,139 @@ class _ReaderScreenState extends State<ReaderScreen> {
     }
   }
 
-  Future<void> _ensureChapter(int i) async {
-    if (i < 0 || i >= _index.length) return;
-    if (_chapterCache.containsKey(i) || _loading.contains(i)) return;
-    _loading.add(i);
-    try {
+  // ---------------------------------------------------------------------------
+  // Chapter loading / list layout
+  // ---------------------------------------------------------------------------
+
+  Future<String?> _loadChapter(int i) async {
+    if (i < 0 || i >= _index.length) return null;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final cached = _chapterCache[i];
+      if (cached != null) return cached;
+      final rev = _chapterRevision[i] ?? 0;
       final text = await repo.loadChapterByIndex(widget.novelId, i);
-      if (text != null && mounted) {
-        setState(() => _chapterCache[i] = text);
-      }
-    } finally {
-      _loading.remove(i);
+      if (text == null) return null;
+      if ((_chapterRevision[i] ?? 0) != rev) continue;
+      return _chapterCache.putIfAbsent(i, () => text);
     }
+    return _chapterCache[i];
   }
 
-  /// Load chapters around [chapterIndex].
+  /// Rebuild the list with [chapterIndex] as the anchor (scroll offset 0).
   ///
-  /// Jump/open uses [includePrevious] = false so the list starts at the target
-  /// chapter and `jumpTo(0)` is always correct (avoids landing on prev chapter).
-  Future<void> _prepareWindowAt(
+  /// Used for opening the book and every jump. The anchor chapter's text is
+  /// loaded before it is shown, so its layout is final on the first frame.
+  Future<void> _anchorAt(
     int chapterIndex, {
-    bool clearCache = false,
-    bool includePrevious = false,
+    double fractionInChapter = 0,
   }) async {
-    final target = chapterIndex.clamp(0, mathMax0(_index.length - 1));
-    final start =
-        includePrevious && target > 0 ? target - 1 : target;
-    final end = (target + 1).clamp(0, mathMax0(_index.length - 1));
+    if (_index.length == 0) return;
+    final target = chapterIndex.clamp(0, _index.length - 1);
+    final token = ++_anchorToken;
+    _extendingForward = false;
+    _extendingBackward = false;
+
+    final text = await _loadChapter(target);
+    if (!mounted || token != _anchorToken) return;
+    // Next chapter too, so a restored fraction near the end is not clamped.
+    if (text != null && target + 1 < _index.length) {
+      await _loadChapter(target + 1);
+      if (!mounted || token != _anchorToken) return;
+    }
+
+    _arrowScrollTarget = null;
     setState(() {
-      if (clearCache) {
-        _chapterCache.clear();
-        _chapterKeys.clear();
-        _chapterBodyKeys.clear();
-      }
-      _windowStart = start;
-      _windowEnd = end;
-      _pruneChapterKeys();
-    });
-    await _ensureChapter(target);
-    if (start < target) await _ensureChapter(start);
-    if (end > target) await _ensureChapter(end);
-    // Prefetch previous for upward scroll (not mounted until prepend).
-    if (!includePrevious && target > 0) {
-      unawaited(_ensureChapter(target - 1));
-    }
-  }
-
-  /// Scroll so [chapterIndex] is at the top. Requires it to be in the window;
-  /// when the window starts at that chapter, this is simply [jumpTo](0).
-  Future<void> _scrollToChapterInWindow(
-    int chapterIndex, {
-    double fractionInChapter = 0,
-  }) async {
-    final target = chapterIndex.clamp(_windowStart, _windowEnd);
-
-    for (var attempt = 0; attempt < 16; attempt++) {
-      await SchedulerBinding.instance.endOfFrame;
-      if (!mounted || !_scroll.hasClients) return;
-
-      // Fast path: target is the first mounted chapter.
-      if (_windowStart == target) {
-        var dest = 0.0;
-        if (fractionInChapter > 0) {
-          final ctx = _chapterKeys[target]?.currentContext;
-          if (ctx != null && ctx.mounted) {
-            final box = ctx.findRenderObject() as RenderBox?;
-            if (box != null && box.attached && box.hasSize) {
-              dest = box.size.height * fractionInChapter.clamp(0.0, 0.95);
-            }
-          } else if (attempt < 15) {
-            continue;
-          }
-        }
-        _scroll.jumpTo(
-          dest.clamp(0.0, _scroll.position.maxScrollExtent),
-        );
-        return;
-      }
-
-      // Slow path: target is below the window start — reveal by layout offset.
-      final ctx = _chapterKeys[target]?.currentContext;
-      if (ctx == null || !ctx.mounted) continue;
-      final box = ctx.findRenderObject() as RenderBox?;
-      if (box == null || !box.attached || !box.hasSize) continue;
-      final viewport = RenderAbstractViewport.maybeOf(box);
-      if (viewport == null) continue;
-      var dest = viewport.getOffsetToReveal(box, 0.0).offset;
-      if (fractionInChapter > 0) {
-        dest += box.size.height * fractionInChapter.clamp(0.0, 0.95);
-      }
-      _scroll.jumpTo(
-        dest.clamp(0.0, _scroll.position.maxScrollExtent),
+      _booting = false;
+      _listGen++;
+      _anchorChapter = target;
+      _firstLoaded = target;
+      _endLoaded = text == null
+          ? target
+          : (_chapterCache.containsKey(target + 1) ? target + 2 : target + 1);
+      _chapterKeys.clear();
+      _chapterBodyKeys.clear();
+      _chapterCache.removeWhere(
+        (i, _) => i < _firstLoaded - 1 || i > _endLoaded,
       );
-      return;
+    });
+    // Offset 0 is the anchor's top in the new layout; set it before layout.
+    if (_scroll.hasClients) _scroll.jumpTo(0);
+
+    await _revealChapter(target, fractionInChapter, token);
+    if (!mounted || token != _anchorToken) return;
+    _lastAnchor = (chapter: target, fraction: fractionInChapter);
+    unawaited(_extendBackward());
+    _scheduleExtendCheck();
+  }
+
+  /// Append the next unloaded chapter below the forward sliver.
+  Future<void> _extendForward() async {
+    if (_extendingForward || _endLoaded >= _index.length) return;
+    final token = _anchorToken;
+    final i = _endLoaded;
+    _extendingForward = true;
+    String? text;
+    try {
+      text = await _loadChapter(i);
+    } finally {
+      if (token == _anchorToken) _extendingForward = false;
+    }
+    if (!mounted || token != _anchorToken || text == null) return;
+    if (_endLoaded != i) return;
+    setState(() => _endLoaded = i + 1);
+    _scheduleExtendCheck();
+  }
+
+  /// Prepend the previous unloaded chapter above the backward sliver.
+  Future<void> _extendBackward() async {
+    if (_extendingBackward || _firstLoaded <= 0) return;
+    final token = _anchorToken;
+    final i = _firstLoaded - 1;
+    _extendingBackward = true;
+    String? text;
+    try {
+      text = await _loadChapter(i);
+    } finally {
+      if (token == _anchorToken) _extendingBackward = false;
+    }
+    if (!mounted || token != _anchorToken || text == null) return;
+    if (_firstLoaded != i + 1) return;
+    setState(() => _firstLoaded = i);
+    _scheduleExtendCheck();
+  }
+
+  void _scheduleExtendCheck() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _maybeExtend();
+    });
+  }
+
+  /// Keep a couple of viewports of loaded text on both sides of the view.
+  void _maybeExtend() {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    if (!pos.hasContentDimensions || !pos.hasViewportDimension) return;
+    final margin =
+        (pos.viewportDimension * 2).clamp(1200.0, double.infinity);
+    if (pos.extentAfter < margin) unawaited(_extendForward());
+    if (pos.extentBefore < margin) unawaited(_extendBackward());
+  }
+
+  /// Called while building chapter [i]; lazy slivers only build what is near
+  /// the viewport, so this is an extent-estimate-independent prefetch trigger.
+  void _onChapterBuilt(int i) {
+    if ((i >= _endLoaded - 2 && _endLoaded < _index.length) ||
+        (i <= _firstLoaded + 1 && _firstLoaded > 0)) {
+      _scheduleExtendCheckFromBuild(i);
     }
   }
 
-  /// Jump/open helper. Does not mount the previous chapter in the list.
-  Future<void> _openWindowAt(
-    int chapterIndex, {
-    double fractionInChapter = 0,
-    bool clearCache = false,
-  }) async {
-    await _prepareWindowAt(
-      chapterIndex,
-      clearCache: clearCache,
-      includePrevious: false,
-    );
-    await _scrollToChapterInWindow(
-      chapterIndex,
-      fractionInChapter: fractionInChapter,
-    );
+  void _scheduleExtendCheckFromBuild(int i) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (i >= _endLoaded - 2) unawaited(_extendForward());
+      if (i <= _firstLoaded + 1) unawaited(_extendBackward());
+    });
   }
 
   GlobalKey _keyFor(int chapterIndex) =>
@@ -263,196 +316,135 @@ class _ReaderScreenState extends State<ReaderScreen> {
   GlobalKey _bodyKeyFor(int chapterIndex) =>
       _chapterBodyKeys.putIfAbsent(chapterIndex, GlobalKey.new);
 
-  void _pruneChapterKeys() {
-    _chapterKeys.removeWhere(
-      (i, _) => i < _windowStart || i > _windowEnd,
-    );
-    _chapterBodyKeys.removeWhere(
-      (i, _) => i < _windowStart || i > _windowEnd,
-    );
-  }
-
   /// One blank line between chapters (matches body line box).
   double get _chapterGap => _reading.fontSize * _reading.lineHeight;
 
   /// Body text as shown in the reader (no trailing blank lines).
   String _displayBody(String text) => text.trimRight();
 
-  void _onScroll() {
-    if (!_scroll.hasClients ||
-        _index.length == 0 ||
-        _windowBusy ||
-        _jumping ||
-        _editing ||
-        _restoringAfterEdit) {
-      return;
-    }
+  /// Space between the screen top and the reading viewport.
+  double get _viewportTopInset => MediaQuery.paddingOf(context).top + 12;
+
+  /// Reading line used for progress / anchors, in viewport coordinates.
+  static const double _probeY = 84;
+
+  double _clampOffset(double v) {
     final pos = _scroll.position;
+    return v.clamp(pos.minScrollExtent, pos.maxScrollExtent);
+  }
 
-    // Near bottom → append next chapters.
-    if (pos.extentAfter < 1200) {
-      final next = _windowEnd + 1;
-      if (next < _index.length) {
-        setState(() => _windowEnd = next);
-        unawaited(_ensureChapter(next));
-        if (next + 1 < _index.length) unawaited(_ensureChapter(next + 1));
-      }
+  void _jumpReaderTo(double offset) {
+    if (!_scroll.hasClients) return;
+    _arrowScrollTarget = null;
+    _scroll.jumpTo(_clampOffset(offset));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Measuring / anchoring
+  // ---------------------------------------------------------------------------
+
+  /// Chapter block top (in viewport coordinates) and height, if laid out.
+  ({double top, double height})? _measureChapter(int chapterIndex) {
+    final ctx = _chapterKeys[chapterIndex]?.currentContext;
+    if (ctx == null || !ctx.mounted) return null;
+    final box = ctx.findRenderObject();
+    if (box is! RenderBox || !box.attached || !box.hasSize) return null;
+    final viewport = RenderAbstractViewport.maybeOf(box);
+    if (viewport == null) return null;
+    final top = box.localToGlobal(Offset.zero, ancestor: viewport).dy;
+    return (top: top, height: box.size.height);
+  }
+
+  /// Put [fraction] of [chapterIndex] under the reading line (fraction 0 puts
+  /// the chapter title at the top of the viewport).
+  Future<void> _revealChapter(
+    int chapterIndex,
+    double fraction,
+    int token,
+  ) async {
+    final f = fraction.clamp(0.0, 0.98);
+    for (var attempt = 0; attempt < 12; attempt++) {
+      await SchedulerBinding.instance.endOfFrame;
+      if (!mounted || token != _anchorToken) return;
+      if (!_scroll.hasClients) continue;
+      final m = _measureChapter(chapterIndex);
+      if (m == null) continue;
+      final desiredTop = f <= 0 ? 0.0 : _probeY - m.height * f;
+      final delta = m.top - desiredTop;
+      if (delta.abs() < 0.5) return;
+      final before = _scroll.offset;
+      _jumpReaderTo(before + delta);
+      if ((_scroll.offset - before).abs() < 0.5) return;
     }
+  }
 
-    // Near top → prepend previous chapter.
-    if (pos.extentBefore < 1200 && _windowStart > 0) {
-      unawaited(_prependPreviousChapter());
+  ReadingAnchor? _captureAnchor() {
+    if (!_scroll.hasClients || _booting) return null;
+    final chapter = _estimateVisibleChapter();
+    final m = _measureChapter(chapter);
+    if (m == null || m.height <= 0) return null;
+    return (
+      chapter: chapter,
+      fraction: ((_probeY - m.top) / m.height).clamp(0.0, 1.0),
+    );
+  }
+
+  /// After chapter heights changed, put [anchor] back under the reading line.
+  Future<void> _restoreAnchor(ReadingAnchor anchor) async {
+    final token = _anchorToken;
+    for (var attempt = 0; attempt < 6; attempt++) {
+      await SchedulerBinding.instance.endOfFrame;
+      if (!mounted || token != _anchorToken || !_scroll.hasClients) return;
+      final m = _measureChapter(anchor.chapter);
+      if (m == null) return;
+      final delta = m.top + m.height * anchor.fraction - _probeY;
+      if (delta.abs() < 0.5) break;
+      final before = _scroll.offset;
+      _jumpReaderTo(before + delta);
+      if ((_scroll.offset - before).abs() < 0.5) break;
     }
+    if (mounted && token == _anchorToken) _lastAnchor = anchor;
+  }
 
-    final span = _windowEnd - _windowStart;
-    // Only trim the far side relative to where the user is reading.
-    if (span > 6) {
-      // Reading near the bottom of the window → drop chapters above.
-      if (pos.extentAfter < 1000 && pos.extentBefore > 3500) {
-        unawaited(_trimLeadingChapter());
-      }
-      // Reading near the top of the window → drop chapters below.
-      if (pos.extentBefore < 1000 && pos.extentAfter > 3500) {
-        _trimTrailingChapter();
-      }
-    }
-
+  void _onScroll() {
+    if (!_scroll.hasClients || _index.length == 0 || _editing) return;
+    _maybeExtend();
+    if (_restoringAfterEdit) return;
+    _lastAnchor = _captureAnchor() ?? _lastAnchor;
     _scheduleProgressSave();
-  }
-
-  Future<void> _prependPreviousChapter() async {
-    if (_windowBusy || !_scroll.hasClients) return;
-    final prev = _windowStart - 1;
-    if (prev < 0) return;
-    _windowBusy = true;
-    try {
-      await _ensureChapter(prev);
-      if (!mounted || !_scroll.hasClients) return;
-      if (_windowStart != prev + 1) return;
-
-      final beforeMax = _scroll.position.maxScrollExtent;
-      final oldPixels = _scroll.position.pixels;
-
-      setState(() => _windowStart = prev);
-      _pruneChapterKeys();
-      if (prev > 0) unawaited(_ensureChapter(prev - 1));
-
-      await SchedulerBinding.instance.endOfFrame;
-      await SchedulerBinding.instance.endOfFrame;
-      if (!mounted || !_scroll.hasClients) return;
-
-      final afterMax = _scroll.position.maxScrollExtent;
-      final inserted = (afterMax - beforeMax).clamp(0.0, double.infinity);
-      _scroll.jumpTo((oldPixels + inserted).clamp(0.0, afterMax));
-    } finally {
-      _windowBusy = false;
-    }
-    // Keep prepending while still near the top (e.g. short chapters).
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scroll.hasClients || _windowBusy) return;
-      if (_scroll.position.extentBefore < 1200 && _windowStart > 0) {
-        unawaited(_prependPreviousChapter());
-      }
-    });
-  }
-
-  Future<void> _trimLeadingChapter() async {
-    if (_windowBusy || !_scroll.hasClients) return;
-    if (_windowEnd - _windowStart <= 6) return;
-    final drop = _windowStart;
-    if (drop >= _windowEnd - 3) return;
-
-    _windowBusy = true;
-    try {
-      final beforeMax = _scroll.position.maxScrollExtent;
-      final oldPixels = _scroll.position.pixels;
-      setState(() {
-        _windowStart = drop + 1;
-        _chapterCache.remove(drop);
-        _chapterKeys.remove(drop);
-        _chapterBodyKeys.remove(drop);
-        _pruneChapterKeys();
-      });
-      await SchedulerBinding.instance.endOfFrame;
-      await SchedulerBinding.instance.endOfFrame;
-      if (!mounted || !_scroll.hasClients) return;
-      final afterMax = _scroll.position.maxScrollExtent;
-      final removed = (beforeMax - afterMax).clamp(0.0, double.infinity);
-      _scroll.jumpTo((oldPixels - removed).clamp(0.0, afterMax));
-    } finally {
-      _windowBusy = false;
-    }
-  }
-
-  void _trimTrailingChapter() {
-    if (_windowBusy || !_scroll.hasClients) return;
-    if (_windowEnd - _windowStart <= 6) return;
-    final drop = _windowEnd;
-    if (drop <= _windowStart + 3) return;
-    setState(() {
-      _windowEnd = drop - 1;
-      _chapterCache.remove(drop);
-      _chapterKeys.remove(drop);
-      _chapterBodyKeys.remove(drop);
-      _pruneChapterKeys();
-    });
   }
 
   void _scheduleProgressSave() {
     _progressSaveTimer?.cancel();
     _progressSaveTimer = Timer(const Duration(milliseconds: 600), () async {
       if (!mounted || !_scroll.hasClients || _meta == null) return;
-      final chapter = _estimateVisibleChapter();
-      final frac = _fractionInVisibleChapter(chapter);
+      final anchor = _captureAnchor();
+      if (anchor == null) return;
       await repo.updateProgress(
         id: widget.novelId,
-        chapterIndex: chapter,
-        fractionInChapter: frac,
+        chapterIndex: anchor.chapter,
+        fractionInChapter: anchor.fraction,
       );
     });
   }
 
-  /// Chapter whose body currently covers a probe near the top of the viewport.
+  /// Chapter whose block currently covers the reading line.
   int _estimateVisibleChapter() {
-    if (_windowEnd < _windowStart) return 0;
-    if (_chapterKeys.isEmpty) return _windowStart;
-
-    final probeY = MediaQuery.paddingOf(context).top + 96;
-    int? containing;
+    if (_endLoaded <= _firstLoaded) return _anchorChapter;
     int? nearest;
     var nearestDist = double.infinity;
-
-    for (var i = _windowStart; i <= _windowEnd; i++) {
-      final ctx = _chapterKeys[i]?.currentContext;
-      if (ctx == null) continue;
-      final box = ctx.findRenderObject() as RenderBox?;
-      if (box == null || !box.attached || !box.hasSize) continue;
-      final top = box.localToGlobal(Offset.zero).dy;
-      final bottom = top + box.size.height;
-      if (probeY >= top && probeY < bottom) {
-        containing = i;
-        break;
-      }
-      final mid = (top + bottom) / 2;
-      final dist = (probeY - mid).abs();
+    for (var i = _firstLoaded; i < _endLoaded; i++) {
+      final m = _measureChapter(i);
+      if (m == null) continue;
+      final bottom = m.top + m.height;
+      if (_probeY >= m.top && _probeY < bottom) return i;
+      final dist = (_probeY - (m.top + bottom) / 2).abs();
       if (dist < nearestDist) {
         nearestDist = dist;
         nearest = i;
       }
     }
-    return containing ?? nearest ?? _windowStart;
-  }
-
-  double _fractionInVisibleChapter(int chapterIndex) {
-    final ctx = _chapterKeys[chapterIndex]?.currentContext;
-    if (ctx == null) return 0;
-    final box = ctx.findRenderObject() as RenderBox?;
-    if (box == null || !box.attached || !box.hasSize || box.size.height <= 0) {
-      return 0;
-    }
-    final top = box.localToGlobal(Offset.zero).dy;
-    final probeY = MediaQuery.paddingOf(context).top + 96;
-    return ((probeY - top) / box.size.height).clamp(0.0, 1.0);
+    return nearest ?? _anchorChapter;
   }
 
   void _toggleChrome() {
@@ -469,10 +461,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final line = _reading.fontSize * _reading.lineHeight;
     final step = (line * 2.5).clamp(48.0, 120.0);
     final from = _arrowScrollTarget ?? _scroll.offset;
-    final next = (from + direction * step).clamp(
-      0.0,
-      _scroll.position.maxScrollExtent,
-    );
+    final next = _clampOffset(from + direction * step);
     if ((next - _scroll.offset).abs() < 0.5 &&
         (_arrowScrollTarget == null ||
             (_arrowScrollTarget! - next).abs() < 0.5)) {
@@ -494,6 +483,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
       }),
     );
   }
+
+  // ---------------------------------------------------------------------------
+  // Editing
+  // ---------------------------------------------------------------------------
 
   void _enterEdit(int chapterIndex) {
     final text = _chapterCache[chapterIndex];
@@ -623,10 +616,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
       // keyboard / height changes can still nudge pixels on Android.
       final baseline = _readerOffsetBeforeEdit;
       if (baseline != null) {
-        final max = _scroll.position.maxScrollExtent;
-        final target = baseline.clamp(0.0, max);
+        final target = _clampOffset(baseline);
         if ((_scroll.offset - target).abs() > 0.5) {
-          _scroll.jumpTo(target);
+          _jumpReaderTo(target);
           await SchedulerBinding.instance.endOfFrame;
           await SchedulerBinding.instance.endOfFrame;
         }
@@ -656,24 +648,18 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
         // Huge deltas usually mean layout is still settling — don't leap.
         if (delta.abs() > viewport * 1.5) {
-          if (baseline != null) {
-            _scroll.jumpTo(
-              baseline.clamp(0.0, _scroll.position.maxScrollExtent),
-            );
-          }
+          if (baseline != null) _jumpReaderTo(baseline);
           continue;
         }
 
-        final next = (_scroll.offset + delta).clamp(
-          0.0,
-          _scroll.position.maxScrollExtent,
-        );
+        final next = _clampOffset(_scroll.offset + delta);
         if ((next - _scroll.offset).abs() < 0.5) return;
-        _scroll.jumpTo(next);
+        _jumpReaderTo(next);
       }
     } finally {
       _restoringAfterEdit = false;
       _readerOffsetBeforeEdit = null;
+      if (mounted) _lastAnchor = _captureAnchor() ?? _lastAnchor;
     }
   }
 
@@ -721,15 +707,26 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final index = await repo.loadIndex(widget.novelId);
     await _leaveEditMode();
     if (!mounted) return;
+    final chapterCountChanged = index.length != _index.length;
     setState(() {
       _meta = meta;
       _index = index;
+      _chapterRevision[idx] = (_chapterRevision[idx] ?? 0) + 1;
       _chapterCache[idx] = newText;
       _editing = false;
       _editingChapter = null;
+      if (chapterCountChanged) {
+        // Chapter numbering shifted; cached bodies no longer line up.
+        _chapterCache.removeWhere((i, _) => i != idx);
+      }
     });
     _readerFocus.requestFocus();
-    await _scrollReaderToCaret(idx, newText, caret);
+    if (chapterCountChanged) {
+      _readerOffsetBeforeEdit = null;
+      await _anchorAt(idx);
+    } else {
+      await _scrollReaderToCaret(idx, newText, caret);
+    }
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('已保存')),
@@ -739,15 +736,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   Future<void> _jumpToChapter(int i) async {
     setState(() => _chromeVisible = false);
-    _jumping = true;
-    try {
-      await _openWindowAt(i, clearCache: true);
-      // Settle layout before allowing prepend (avoids racing jumpTo(0)).
-      await SchedulerBinding.instance.endOfFrame;
-      await SchedulerBinding.instance.endOfFrame;
-    } finally {
-      _jumping = false;
-    }
+    _readerFocus.requestFocus();
+    await _anchorAt(i);
+    if (!mounted) return;
     await repo.updateProgress(
       id: widget.novelId,
       chapterIndex: i,
@@ -764,7 +755,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     if (result == null || result.find.isEmpty) return;
 
     final gen = ++_replaceGen;
-    final priorityChapter = _windowStart;
+    final priorityChapter = _estimateVisibleChapter();
     final priorityDone = Completer<ReplacePriorityResult>();
 
     final job = repo.replaceAllInNovel(
@@ -774,14 +765,21 @@ class _ReaderScreenState extends State<ReaderScreen> {
       priorityChapterIndex: priorityChapter,
       onChapterUpdated: (update) {
         if (!mounted || gen != _replaceGen) return;
+        final i = update.chapterIndex;
+        final mountedInList = i >= _firstLoaded && i < _endLoaded;
+        final anchor = mountedInList ? _captureAnchor() : null;
         setState(() {
           _index = update.index;
-          _chapterCache[update.chapterIndex] = update.text;
+          _chapterRevision[i] = (_chapterRevision[i] ?? 0) + 1;
+          if (mountedInList || _chapterCache.containsKey(i)) {
+            _chapterCache[i] = update.text;
+          }
           final m = _meta;
           if (m != null) {
             _meta = m.copyWith(totalChars: update.index.totalChars);
           }
         });
+        if (anchor != null) unawaited(_restoreAnchor(anchor));
       },
       onPriorityComplete: (priority) {
         if (!priorityDone.isCompleted) priorityDone.complete(priority);
@@ -848,7 +846,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     return Scaffold(
       backgroundColor: bg,
       // Never resize the body for the IME — otherwise Android rewrites the
-      // (still-mounted) reader ListView's ScrollPosition when the keyboard
+      // (still-mounted) reader list's ScrollPosition when the keyboard
       // opens/closes around edit → save.
       resizeToAvoidBottomInset: false,
       body: Stack(
@@ -918,86 +916,101 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   Widget _buildReaderList() {
     final style = _bodyStyle(context);
-    final items = <int>[
-      for (var i = _windowStart; i <= _windowEnd && i < _index.length; i++) i,
-    ];
-    // Eagerly build all chapters in the sliding window (usually ≤8).
-    // ListView.builder would skip off-screen keys and break jump-to-chapter.
-    return NotificationListener<OverscrollNotification>(
-      onNotification: (n) {
-        // Pulling past the top → load earlier chapters even when scroll offset
-        // cannot decrease further (common after jump-to-chapter).
-        if (n.overscroll < 0 &&
-            n.metrics.pixels <= n.metrics.minScrollExtent + 0.5 &&
-            _windowStart > 0 &&
-            !_windowBusy &&
-            !_jumping) {
-          unawaited(_prependPreviousChapter());
-        }
-        return false;
-      },
-      child: ListView(
-        controller: _scroll,
-        padding: EdgeInsets.fromLTRB(
-          18,
-          MediaQuery.paddingOf(context).top + 12,
-          18,
-          48,
-        ),
-        children: [
-          for (var i = 0; i < items.length; i++)
-            _buildChapterBlock(
-              chapterIndex: items[i],
-              isFirst: i == 0,
-              style: style,
-            ),
-        ],
+    final centerKey = ValueKey<String>('reader-forward-$_listGen');
+    const horizontal = EdgeInsets.symmetric(horizontal: 18);
+    return Padding(
+      padding: EdgeInsets.only(top: _viewportTopInset),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final width = constraints.maxWidth;
+          final previous = _lastListWidth;
+          _lastListWidth = width;
+          final anchor = _lastAnchor;
+          if (previous != null &&
+              (previous - width).abs() > 0.5 &&
+              anchor != null) {
+            // Text reflowed; keep the same passage under the reading line.
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) unawaited(_restoreAnchor(anchor));
+            });
+          }
+          return CustomScrollView(
+            controller: _scroll,
+            center: centerKey,
+            slivers: [
+              SliverPadding(
+                key: ValueKey<String>('reader-backward-$_listGen'),
+                padding: horizontal,
+                sliver: SliverList(
+                  delegate: SliverChildBuilderDelegate(
+                    (context, k) => _buildChapterBlock(
+                      chapterIndex: _anchorChapter - 1 - k,
+                      style: style,
+                    ),
+                    childCount: _anchorChapter - _firstLoaded,
+                  ),
+                ),
+              ),
+              SliverPadding(
+                key: centerKey,
+                padding: horizontal,
+                sliver: SliverList(
+                  delegate: SliverChildBuilderDelegate(
+                    (context, k) => _buildChapterBlock(
+                      chapterIndex: _anchorChapter + k,
+                      style: style,
+                    ),
+                    childCount: _endLoaded - _anchorChapter,
+                  ),
+                ),
+              ),
+              SliverToBoxAdapter(
+                child: _endLoaded < _index.length
+                    ? const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 24),
+                        child: Center(
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      )
+                    : const SizedBox(height: 48),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 
+  /// Title + body + trailing gap. Only called for chapters with loaded text.
   Widget _buildChapterBlock({
     required int chapterIndex,
-    required bool isFirst,
     required TextStyle style,
   }) {
+    _onChapterBuilt(chapterIndex);
     final entry = _index[chapterIndex];
-    final text = _chapterCache[chapterIndex];
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (!isFirst) SizedBox(height: _chapterGap),
-        KeyedSubtree(
-          key: _keyFor(chapterIndex),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                entry?.title ?? '第${chapterIndex + 1}章',
-                style: style.copyWith(
-                  fontSize: _reading.fontSize + 4,
-                  fontWeight: FontWeight.w700,
-                  color: OwnReadColors.orange,
-                ),
-              ),
-              SizedBox(height: _chapterGap * 0.5),
-              if (text == null)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 24),
-                  child: Center(
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
-              else
-                Text(
-                  _displayBody(text),
-                  key: _bodyKeyFor(chapterIndex),
-                  style: style,
-                ),
-            ],
+    final text = _chapterCache[chapterIndex] ?? '';
+    return KeyedSubtree(
+      key: _keyFor(chapterIndex),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            entry?.title ?? '第${chapterIndex + 1}章',
+            style: style.copyWith(
+              fontSize: _reading.fontSize + 4,
+              fontWeight: FontWeight.w700,
+              color: OwnReadColors.orange,
+            ),
           ),
-        ),
-      ],
+          SizedBox(height: _chapterGap * 0.5),
+          Text(
+            _displayBody(text),
+            key: _bodyKeyFor(chapterIndex),
+            style: style,
+          ),
+          SizedBox(height: _chapterGap),
+        ],
+      ),
     );
   }
 

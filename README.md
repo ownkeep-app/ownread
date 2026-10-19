@@ -1,4 +1,4 @@
-# OwnRead / 本地阅读
+# OwnRead / 私人阅读
 
 跨平台（**Android**、**macOS**）离线 TXT 小说阅读器。不联网、不使用数据库，全部数据保存在本地文件仓库。
 
@@ -107,7 +107,7 @@ flutter build appbundle --release
 - APK：`build/app/outputs/flutter-apk/app-release.apk`
 - AAB：`build/app/outputs/bundle/release/app-release.aab`
 
-应用名：**本地阅读**；applicationId：`com.ownread.ownread`。
+应用名：**私人阅读**；applicationId：`com.ownread.ownread`。
 
 ### macOS
 
