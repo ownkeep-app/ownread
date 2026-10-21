@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
@@ -16,6 +14,7 @@ class ReaderChrome extends StatefulWidget {
     required this.currentIndex,
     required this.onBack,
     required this.onFindReplace,
+    required this.onSettings,
     required this.onJumpChapter,
     required this.onDismiss,
   });
@@ -25,6 +24,9 @@ class ReaderChrome extends StatefulWidget {
   final int currentIndex;
   final VoidCallback onBack;
   final VoidCallback onFindReplace;
+
+  /// Opens the global settings dialog (theme, background, font…).
+  final VoidCallback onSettings;
   final ValueChanged<int> onJumpChapter;
   final VoidCallback onDismiss;
 
@@ -40,19 +42,10 @@ class _ReaderChromeState extends State<ReaderChrome>
   late final Animation<Offset> _slide;
   late final Animation<double> _fade;
   bool _closing = false;
-  late DateTime _now;
-  Timer? _clock;
-
-  static final _timeFormat = DateFormat('yyyy-MM-dd HH:mm:ss');
 
   @override
   void initState() {
     super.initState();
-    _now = DateTime.now();
-    _clock = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) return;
-      setState(() => _now = DateTime.now());
-    });
     _anim = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 260),
@@ -72,7 +65,6 @@ class _ReaderChromeState extends State<ReaderChrome>
 
   @override
   void dispose() {
-    _clock?.cancel();
     _anim.dispose();
     _chapterSearch.dispose();
     super.dispose();
@@ -137,10 +129,16 @@ class _ReaderChromeState extends State<ReaderChrome>
     final size = MediaQuery.sizeOf(context);
     final shad = ShadTheme.of(context);
     final cs = shad.colorScheme;
-    final theme = Theme.of(context);
+    final dark = shad.brightness == Brightness.dark;
     // Keep a stable, moderate panel width on phone and desktop (never nearly full-bleed).
-    final sidebarWidth = (size.width * 0.7).clamp(240.0, 280.0);
+    final sidebarWidth = (size.width * 0.78).clamp(260.0, 320.0);
     final filtered = _filtered;
+    final accent = OwnReadAccent.text(context);
+
+    final searchBorder = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(10),
+      borderSide: BorderSide(color: cs.border),
+    );
 
     return Stack(
       children: [
@@ -150,7 +148,9 @@ class _ReaderChromeState extends State<ReaderChrome>
             child: GestureDetector(
               onTap: _close,
               behavior: HitTestBehavior.opaque,
-              child: ColoredBox(color: cs.foreground.withValues(alpha: 0.18)),
+              child: ColoredBox(
+                color: Colors.black.withValues(alpha: dark ? 0.45 : 0.22),
+              ),
             ),
           ),
         ),
@@ -161,160 +161,194 @@ class _ReaderChromeState extends State<ReaderChrome>
           width: sidebarWidth,
           child: SlideTransition(
             position: _slide,
-            child: Material(
-              elevation: 8,
-              color: cs.card,
-              child: SafeArea(
-                right: false,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(4, 4, 8, 0),
-                      child: Row(
-                        children: [
-                          IconButton(
-                            tooltip: '返回',
-                            onPressed: widget.onBack,
-                            icon: Icon(
-                              LucideIcons.arrowLeft,
-                              color: cs.foreground,
-                            ),
-                          ),
-                          Expanded(
-                            child: Text(
-                              widget.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: theme.textTheme.titleMedium?.copyWith(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: cs.card,
+                border: Border(right: BorderSide(color: cs.border)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: dark ? 0.4 : 0.12),
+                    blurRadius: 30,
+                    offset: const Offset(6, 0),
+                  ),
+                ],
+              ),
+              child: Material(
+                type: MaterialType.transparency,
+                child: SafeArea(
+                  right: false,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(10, 12, 14, 4),
+                        child: Row(
+                          children: [
+                            IconButton(
+                              tooltip: '返回',
+                              onPressed: widget.onBack,
+                              style: IconButton.styleFrom(
+                                backgroundColor: cs.muted,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                              ),
+                              icon: Icon(
+                                LucideIcons.arrowLeft,
+                                size: 18,
                                 color: cs.foreground,
-                                fontWeight: FontWeight.w600,
                               ),
                             ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: SizedBox(
-                              height: 36,
-                              child: TextField(
-                                controller: _chapterSearch,
-                                style: TextStyle(
-                                  color: cs.foreground,
-                                  fontSize: 13,
-                                ),
-                                cursorColor: OwnReadColors.orange,
-                                decoration: InputDecoration(
-                                  isDense: true,
-                                  hintText: '章节名 / 序号',
-                                  hintStyle: TextStyle(
-                                    color: cs.mutedForeground,
-                                    fontSize: 13,
-                                  ),
-                                  prefixIcon: Icon(
-                                    LucideIcons.search,
-                                    size: 16,
-                                    color: cs.mutedForeground,
-                                  ),
-                                  prefixIconConstraints: const BoxConstraints(
-                                    minWidth: 36,
-                                    minHeight: 36,
-                                  ),
-                                  suffixIcon: _query.isEmpty
-                                      ? null
-                                      : IconButton(
-                                          tooltip: '清除',
-                                          padding: EdgeInsets.zero,
-                                          constraints: const BoxConstraints(
-                                            minWidth: 32,
-                                            minHeight: 32,
-                                          ),
-                                          onPressed: () {
-                                            _chapterSearch.clear();
-                                            setState(() => _query = '');
-                                          },
-                                          icon: Icon(
-                                            LucideIcons.x,
-                                            size: 14,
-                                            color: cs.mutedForeground,
-                                          ),
-                                        ),
-                                  contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 8,
-                                    vertical: 8,
-                                  ),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(8),
-                                    borderSide: BorderSide(color: cs.border),
-                                  ),
-                                  enabledBorder: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(8),
-                                    borderSide: BorderSide(color: cs.border),
-                                  ),
-                                  focusedBorder: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(8),
-                                    borderSide: const BorderSide(
-                                      color: OwnReadColors.orange,
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    widget.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: OwnReadType.heading(
+                                      size: 16,
+                                      color: cs.foreground,
                                     ),
                                   ),
-                                ),
-                                onChanged: (v) => setState(() => _query = v),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '共 ${widget.chapters.length} 章',
+                                    style: TextStyle(
+                                      color: cs.mutedForeground,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 8),
-                          SizedBox(
-                            height: 36,
-                            child: OutlinedButton(
-                              onPressed: widget.onFindReplace,
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: OwnReadColors.orange,
-                                side: BorderSide(
-                                  color: OwnReadColors.orange
-                                      .withValues(alpha: 0.45),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              tooltip: '设置',
+                              onPressed: widget.onSettings,
+                              style: IconButton.styleFrom(
+                                backgroundColor: cs.muted,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
                                 ),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 10,
-                                ),
-                                minimumSize: const Size(0, 36),
-                                tapTargetSize:
-                                    MaterialTapTargetSize.shrinkWrap,
                               ),
-                              child: const Text(
-                                '查找替换',
-                                style: TextStyle(fontSize: 12),
+                              icon: Icon(
+                                LucideIcons.settings,
+                                size: 17,
+                                color: cs.foreground,
                               ),
                             ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                      child: Text(
-                        _timeFormat.format(_now),
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: cs.mutedForeground,
-                          fontSize: 12,
-                          fontFeatures: const [FontFeature.tabularFigures()],
+                          ],
                         ),
                       ),
-                    ),
-                    Divider(height: 1, color: cs.border),
-                    Expanded(
-                      child: _ChapterListScroller(
-                        hits: filtered,
-                        currentIndex: widget.currentIndex,
-                        onJumpChapter: widget.onJumpChapter,
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: SizedBox(
+                                height: 38,
+                                child: TextField(
+                                  controller: _chapterSearch,
+                                  style: TextStyle(
+                                    color: cs.foreground,
+                                    fontSize: 13,
+                                  ),
+                                  cursorColor: OwnReadAccent.of(context),
+                                  decoration: InputDecoration(
+                                    isDense: true,
+                                    filled: true,
+                                    fillColor: cs.background,
+                                    hintText: '章节名 / 序号',
+                                    hintStyle: TextStyle(
+                                      color: cs.mutedForeground,
+                                      fontSize: 13,
+                                    ),
+                                    prefixIcon: Icon(
+                                      LucideIcons.search,
+                                      size: 15,
+                                      color: cs.mutedForeground,
+                                    ),
+                                    prefixIconConstraints: const BoxConstraints(
+                                      minWidth: 34,
+                                      minHeight: 38,
+                                    ),
+                                    suffixIcon: _query.isEmpty
+                                        ? null
+                                        : IconButton(
+                                            tooltip: '清除',
+                                            padding: EdgeInsets.zero,
+                                            constraints: const BoxConstraints(
+                                              minWidth: 32,
+                                              minHeight: 32,
+                                            ),
+                                            onPressed: () {
+                                              _chapterSearch.clear();
+                                              setState(() => _query = '');
+                                            },
+                                            icon: Icon(
+                                              LucideIcons.x,
+                                              size: 14,
+                                              color: cs.mutedForeground,
+                                            ),
+                                          ),
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 10,
+                                    ),
+                                    border: searchBorder,
+                                    enabledBorder: searchBorder,
+                                    focusedBorder: searchBorder.copyWith(
+                                      borderSide: BorderSide(
+                                        color: OwnReadAccent.of(context),
+                                      ),
+                                    ),
+                                  ),
+                                  onChanged: (v) => setState(() => _query = v),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            SizedBox(
+                              height: 38,
+                              child: OutlinedButton.icon(
+                                onPressed: widget.onFindReplace,
+                                icon: const Icon(LucideIcons.replace, size: 14),
+                                label: const Text(
+                                  '查找替换',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: accent,
+                                  side: BorderSide(
+                                    color: OwnReadAccent.of(context)
+                                        .withValues(alpha: 0.4),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                  ),
+                                  minimumSize: const Size(0, 38),
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
+                      Divider(height: 1, color: cs.border),
+                      Expanded(
+                        child: _ChapterListScroller(
+                          hits: filtered,
+                          currentIndex: widget.currentIndex,
+                          onJumpChapter: widget.onJumpChapter,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -396,35 +430,69 @@ class _ChapterListScrollerState extends State<_ChapterListScroller> {
         ),
       );
     }
+    final dark = ShadTheme.of(context).brightness == Brightness.dark;
+    final accent = OwnReadAccent.text(context);
     return ListView.builder(
       controller: _scroll,
-      padding: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.fromLTRB(8, 6, 8, 16),
       itemExtent: _itemExtent,
       itemCount: widget.hits.length,
       itemBuilder: (_, i) {
         final hit = widget.hits[i];
         final c = hit.entry;
         final selected = hit.index == widget.currentIndex;
-        return ListTile(
-          dense: true,
-          selected: selected,
-          title: Text(
-            c.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: selected ? OwnReadColors.orange : cs.foreground,
-              fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Material(
+            color: selected
+                ? OwnReadAccent.of(context).withValues(alpha: dark ? 0.16 : 0.10)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(10),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: () => widget.onJumpChapter(hit.index),
+              child: Row(
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    width: 3,
+                    height: selected ? 20 : 0,
+                    margin: const EdgeInsets.only(left: 4, right: 9),
+                    decoration: BoxDecoration(
+                      color: OwnReadAccent.of(context),
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      c.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: selected ? accent : cs.foreground,
+                        fontSize: 14,
+                        height: 1.35,
+                        fontWeight:
+                            selected ? FontWeight.w600 : FontWeight.w400,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Padding(
+                    padding: const EdgeInsets.only(right: 10),
+                    child: Text(
+                      '${c.charCount}',
+                      style: TextStyle(
+                        color: cs.mutedForeground.withValues(alpha: 0.8),
+                        fontSize: 11,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-          trailing: Text(
-            '${c.charCount}',
-            style: TextStyle(
-              color: cs.mutedForeground,
-              fontSize: 12,
-            ),
-          ),
-          onTap: () => widget.onJumpChapter(hit.index),
         );
       },
     );

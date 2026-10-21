@@ -127,7 +127,12 @@ void main() {
   testWidgets('opens at saved chapter with its title at the top',
       (tester) async {
     await pumpReader(tester);
-    expect(titleTop(tester, _startChapter), moreOrLessEquals(12, epsilon: 1));
+    // Running header (44) + the small breathing space above each chapter title
+    // (0.6 of one 18px × 1.7 line).
+    expect(
+      titleTop(tester, _startChapter),
+      moreOrLessEquals(44 + 18 * 1.7 * 0.6, epsilon: 1),
+    );
     // Previous chapter got loaded above without moving the current one.
     await slowDrag(tester, 200);
     expect(find.text(_title(_startChapter - 1)), findsOneWidget);
@@ -214,5 +219,20 @@ void main() {
     expect(repo.progressChapter, savedChapter);
     expect(titleTop(tester, savedChapter), moreOrLessEquals(savedTop, epsilon: 2));
     expect(repo.progressFraction, moreOrLessEquals(savedFraction, epsilon: 0.01));
+  });
+
+  testWidgets('sidebar settings button opens the settings dialog',
+      (tester) async {
+    await pumpReader(tester);
+    await tester.tapAt(const Offset(400, 500));
+    await settle(tester, frames: 30);
+    await tester.tap(find.byTooltip('设置'));
+    await settle(tester, frames: 30);
+    expect(find.text('主题'), findsOneWidget);
+    expect(find.text('排版'), findsOneWidget);
+    // Library backup stays on the bookshelf only.
+    expect(find.text('导出所有'), findsNothing);
+    // Sidebar closed so changes show on the page.
+    expect(find.text('章节名 / 序号'), findsNothing);
   });
 }

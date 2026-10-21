@@ -13,6 +13,7 @@ class AppSettings extends ChangeNotifier {
 
   static const _kReading = 'ownread.reading_settings';
   static const _kSort = 'ownread.library_sort';
+  static const _kAutoLock = 'ownread.auto_lock';
 
   ReadingSettings get reading {
     final raw = _prefs.getString(_kReading);
@@ -28,6 +29,14 @@ class AppSettings extends ChangeNotifier {
 
   Future<void> setReading(ReadingSettings s) async {
     await _prefs.setString(_kReading, jsonEncode(s.toJson()));
+    notifyListeners();
+  }
+
+  /// Privacy cover after idle / leaving the app. On by default.
+  bool get autoLock => _prefs.getBool(_kAutoLock) ?? true;
+
+  Future<void> setAutoLock(bool enabled) async {
+    await _prefs.setBool(_kAutoLock, enabled);
     notifyListeners();
   }
 

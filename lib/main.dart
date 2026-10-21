@@ -52,13 +52,20 @@ class OwnReadApp extends StatelessWidget {
         return ShadApp(
           title: '私人阅读',
           debugShowCheckedModeBanner: false,
-          theme: buildOwnReadLightTheme(),
-          darkTheme: buildOwnReadDarkTheme(),
+          theme: buildOwnReadLightTheme(
+            settings.reading.font,
+            settings.reading.accent,
+          ),
+          darkTheme: buildOwnReadDarkTheme(
+            settings.reading.font,
+            settings.reading.accent,
+          ),
           themeMode: dark ? ThemeMode.dark : ThemeMode.light,
           materialThemeBuilder: buildOwnReadMaterialTheme,
           // ShadApp is WidgetsApp-based; Material SnackBars need this ancestor.
           builder: (context, child) => ScaffoldMessenger(
             child: PrivacyGuard(
+              enabled: settings.autoLock,
               idleTimeout: AppEnv.privacyIdleTimeout,
               unlockHold: AppEnv.privacyUnlockHold,
               child: child ?? const SizedBox.shrink(),

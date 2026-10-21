@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -10,8 +11,11 @@ import '../../../core/models/chapter_index.dart';
 import '../../../core/models/novel_meta.dart';
 import '../../../core/models/reading_settings.dart';
 import '../../../core/services/app_settings.dart';
+import '../../../core/services/display_text.dart';
 import '../../../core/storage/novel_repository.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/widgets/reading_background.dart';
+import '../../library/widgets/reading_settings_dialog.dart';
 import '../widgets/find_replace_dialog.dart';
 import '../widgets/reader_chrome.dart';
 
@@ -46,7 +50,8 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class _ReaderScreenState extends State<ReaderScreen>
+    with SingleTickerProviderStateMixin {
   final _scroll = ScrollController();
   final _chapterCache = <int, String>{};
 
@@ -90,7 +95,16 @@ class _ReaderScreenState extends State<ReaderScreen> {
   final Map<int, GlobalKey> _chapterBodyKeys = {};
 
   /// Last known reading position; used to restore after a width change.
-  ReadingAnchor? _lastAnchor;
+  /// Also drives the running header (chapter title + progress).
+  final _anchorNotifier = ValueNotifier<ReadingAnchor?>(null);
+  ReadingAnchor? get _lastAnchor => _anchorNotifier.value;
+  set _lastAnchor(ReadingAnchor? v) => _anchorNotifier.value = v;
+
+  /// Soft fade-in of the page after opening the book or jumping chapters.
+  late final AnimationController _pageFade = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 320),
+  );
   double? _lastListWidth;
 
   /// Reader list offset captured when entering edit (Android restore fallback).
@@ -131,6 +145,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _editFocus.dispose();
     _editScroll.dispose();
     _readerFocus.dispose();
+    _anchorNotifier.dispose();
+    _pageFade.dispose();
     super.dispose();
   }
 
@@ -156,8 +172,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
         return;
       }
       final index = await repo.loadIndex(widget.novelId);
-      final start =
-          meta.progressChapterIndex.clamp(0, mathMax0(index.length - 1));
+      final start = meta.progressChapterIndex.clamp(
+        0,
+        mathMax0(index.length - 1),
+      );
       _meta = meta;
       _index = index;
       await _anchorAt(start, fractionInChapter: meta.progressFractionInChapter);
@@ -232,6 +250,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     });
     // Offset 0 is the anchor's top in the new layout; set it before layout.
     if (_scroll.hasClients) _scroll.jumpTo(0);
+    unawaited(_pageFade.forward(from: 0));
 
     await _revealChapter(target, fractionInChapter, token);
     if (!mounted || token != _anchorToken) return;
@@ -287,8 +306,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     if (!_scroll.hasClients) return;
     final pos = _scroll.position;
     if (!pos.hasContentDimensions || !pos.hasViewportDimension) return;
-    final margin =
-        (pos.viewportDimension * 2).clamp(1200.0, double.infinity);
+    final margin = (pos.viewportDimension * 2).clamp(1200.0, double.infinity);
     if (pos.extentAfter < margin) unawaited(_extendForward());
     if (pos.extentBefore < margin) unawaited(_extendBackward());
   }
@@ -320,10 +338,43 @@ class _ReaderScreenState extends State<ReaderScreen> {
   double get _chapterGap => _reading.fontSize * _reading.lineHeight;
 
   /// Body text as shown in the reader (no trailing blank lines).
-  String _displayBody(String text) => text.trimRight();
+  /// Shown text per chapter (blank lines removed), reused until the raw
+  /// chapter text changes.
+  final _displayCache = <int, (String, DisplayText)>{};
+
+  DisplayText _display(int chapterIndex, String text) {
+    final hit = _displayCache[chapterIndex];
+    if (hit != null && identical(hit.$1, text)) return hit.$2;
+    if (_displayCache.length > 12) {
+      _displayCache.removeWhere(
+        (i, _) => i < _firstLoaded - 1 || i > _endLoaded,
+      );
+    }
+    final shown = DisplayText.of(text);
+    _displayCache[chapterIndex] = (text, shown);
+    return shown;
+  }
+
+  /// Height of the running header above the reading viewport.
+  static const double _headerHeight = 44;
 
   /// Space between the screen top and the reading viewport.
-  double get _viewportTopInset => MediaQuery.paddingOf(context).top + 12;
+  double get _viewportTopInset =>
+      MediaQuery.paddingOf(context).top + _headerHeight;
+
+  bool get _dark => ShadTheme.of(context).brightness == Brightness.dark;
+
+  /// Comfortable measure for CJK text: roughly 36 characters per line.
+  double _textColumnWidth(double available) {
+    final measure = (_reading.fontSize * 36).clamp(520.0, 880.0);
+    final minSide = available < 600 ? 20.0 : 36.0;
+    return math.min(measure, available - minSide * 2);
+  }
+
+  EdgeInsets _columnPadding(double available) {
+    final side = math.max(0.0, (available - _textColumnWidth(available)) / 2);
+    return EdgeInsets.symmetric(horizontal: side);
+  }
 
   /// Reading line used for progress / anchors, in viewport coordinates.
   static const double _probeY = 84;
@@ -477,10 +528,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
             curve: Curves.easeOutCubic,
           )
           .whenComplete(() {
-        if (_arrowScrollTarget == next) {
-          _arrowScrollTarget = null;
-        }
-      }),
+            if (_arrowScrollTarget == next) {
+              _arrowScrollTarget = null;
+            }
+          }),
     );
   }
 
@@ -492,8 +543,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final text = _chapterCache[chapterIndex];
     if (text == null) return;
     final caret = _caretOffsetForTap(text, chapterIndex);
-    _readerOffsetBeforeEdit =
-        _scroll.hasClients ? _scroll.offset : _readerOffsetBeforeEdit;
+    _readerOffsetBeforeEdit = _scroll.hasClients
+        ? _scroll.offset
+        : _readerOffsetBeforeEdit;
     setState(() {
       _editing = true;
       _editingChapter = chapterIndex;
@@ -512,7 +564,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   /// Map double-tap into a character offset using the laid-out body paragraph.
   int _caretOffsetForTap(String text, int chapterIndex) {
-    final display = _displayBody(text);
+    final shown = _display(chapterIndex, text);
+    final display = shown.text;
     if (display.isEmpty) return 0;
 
     final global = _doubleTapGlobal;
@@ -521,19 +574,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
       final ro = ctx.findRenderObject();
       if (ro is RenderParagraph) {
         final local = ro.globalToLocal(global);
-        return ro
-            .getPositionForOffset(local)
-            .offset
-            .clamp(0, display.length)
+        return shown
+            .toRaw(ro.getPositionForOffset(local).offset)
             .clamp(0, text.length);
       }
       if (ro is RenderBox && ro.hasSize) {
         final local = ro.globalToLocal(global);
         final tp = _bodyPainter(display, maxWidth: ro.size.width);
-        return tp
-            .getPositionForOffset(local)
-            .offset
-            .clamp(0, display.length)
+        return shown
+            .toRaw(tp.getPositionForOffset(local).offset)
             .clamp(0, text.length);
       }
     }
@@ -580,9 +629,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
       final editable = _findRenderEditable();
       if (editable == null || !editable.attached) continue;
 
-      final caretLocal = editable.getLocalRectForCaret(
-        TextPosition(offset: caret),
-      ).topCenter;
+      final caretLocal = editable
+          .getLocalRectForCaret(TextPosition(offset: caret))
+          .topCenter;
       final caretGlobal = editable.localToGlobal(caretLocal);
       final delta = caretGlobal.dy - preferY;
       if (delta.abs() < 1.5) return;
@@ -625,8 +674,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
       }
 
       final preferY = _doubleTapGlobal?.dy;
-      final display = _displayBody(text);
-      final c = caret.clamp(0, display.length);
+      // Caret is in raw (editor) text; the page shows blank-line-free text.
+      final c = DisplayText.of(text).toDisplay(caret);
       final viewport = _scroll.position.viewportDimension;
 
       for (var pass = 0; pass < 6; pass++) {
@@ -641,8 +690,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
         final proto = Rect.fromLTWH(0, 0, 2, _reading.fontSize);
         final caretLocal = ro.getOffsetForCaret(TextPosition(offset: c), proto);
         final caretGlobal = ro.localToGlobal(caretLocal);
-        final targetY = preferY ??
-            (MediaQuery.paddingOf(context).top + viewport / 3);
+        final targetY =
+            preferY ?? (MediaQuery.paddingOf(context).top + viewport / 3);
         final delta = caretGlobal.dy - targetY;
         if (delta.abs() < 1.5) return;
 
@@ -672,8 +721,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _exitEditAndRestoreScroll({required bool keepEditedText}) {
     final idx = _editingChapter;
     final edited = _editController.text;
-    final caret =
-        _editController.selection.baseOffset.clamp(0, edited.length);
+    final caret = _editController.selection.baseOffset.clamp(0, edited.length);
     final textForScroll = keepEditedText
         ? edited
         : (idx != null ? (_chapterCache[idx] ?? edited) : edited);
@@ -696,8 +744,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final idx = _editingChapter;
     if (idx == null) return;
     final newText = _editController.text;
-    final caret =
-        _editController.selection.baseOffset.clamp(0, newText.length);
+    final caret = _editController.selection.baseOffset.clamp(0, newText.length);
     await repo.saveChapterEdit(
       id: widget.novelId,
       chapterIndex: idx,
@@ -728,9 +775,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
       await _scrollReaderToCaret(idx, newText, caret);
     }
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已保存')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已保存')));
     }
   }
 
@@ -744,6 +791,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
       chapterIndex: i,
       fractionInChapter: 0,
     );
+  }
+
+  /// Global settings from the sidebar. The sidebar closes first so changes
+  /// (font, background, colour…) show live on the page behind the dialog.
+  /// Library backup is only offered from the bookshelf.
+  Future<void> _openSettings() async {
+    setState(() => _chromeVisible = false);
+    await ReadingSettingsDialog.show(context, settings);
+    if (mounted) _readerFocus.requestFocus();
   }
 
   Future<void> _openFindReplace() async {
@@ -792,9 +848,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          priority.hadMatch
-              ? '当前章已替换，其余章节后台处理中…'
-              : '当前章无匹配，正在搜索其余章节…',
+          priority.hadMatch ? '当前章已替换，其余章节后台处理中…' : '当前章无匹配，正在搜索其余章节…',
         ),
         duration: const Duration(seconds: 2),
       ),
@@ -815,24 +869,26 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   TextStyle _bodyStyle(BuildContext context) {
-    final fg = ShadTheme.of(context).colorScheme.foreground;
-    return TextStyle(
-      fontFamily: ReadingSettings.fontFamily,
-      fontFamilyFallback: ReadingSettings.fontFamilyFallbacks,
-      fontSize: _reading.fontSize,
+    final dark = ShadTheme.of(context).brightness == Brightness.dark;
+    return OwnReadType.reading(
+      _reading.font,
+      size: _reading.fontSize,
       height: _reading.lineHeight,
-      color: fg,
+      // A touch of tracking keeps dense Hanzi from blurring together.
+      letterSpacing: _reading.fontSize * 0.03,
+      color: OwnReadColors.readerText(dark),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final bg = Theme.of(context).scaffoldBackgroundColor;
+    final background = _reading.background;
+    final bg = background.base(_dark);
 
     if (_booting) {
       return Scaffold(
         backgroundColor: bg,
-        body: const Center(child: CircularProgressIndicator()),
+        body: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
       );
     }
     if (_error != null) {
@@ -851,6 +907,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
       resizeToAvoidBottomInset: false,
       body: Stack(
         children: [
+          // Static page texture; its own layer so scrolling never repaints it.
+          Positioned.fill(
+            child: RepaintBoundary(
+              child: ReadingBackgroundLayer(
+                background: background,
+                dark: _dark,
+              ),
+            ),
+          ),
           // Keep the chapter list mounted while editing so Android does not
           // detach ScrollPosition / reset offset when swapping to the editor.
           IndexedStack(
@@ -879,13 +944,20 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       final ch = _estimateVisibleChapter();
                       _enterEdit(ch);
                     },
-                    child: _buildReaderList(),
+                    child: FadeTransition(
+                      opacity: CurvedAnimation(
+                        parent: _pageFade,
+                        curve: Curves.easeOut,
+                      ),
+                      child: _buildReaderList(),
+                    ),
                   ),
                 ),
               ),
               _buildEditor(),
             ],
           ),
+          if (!_editing) _buildRunningHeader(),
           if (_chromeVisible && !_editing)
             ReaderChrome(
               title: _meta?.title ?? '',
@@ -893,6 +965,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
               currentIndex: _estimateVisibleChapter(),
               onBack: () => Navigator.of(context).maybePop(),
               onFindReplace: _openFindReplace,
+              onSettings: _openSettings,
               onJumpChapter: _jumpToChapter,
               onDismiss: () {
                 setState(() => _chromeVisible = false);
@@ -901,12 +974,28 @@ class _ReaderScreenState extends State<ReaderScreen> {
             ),
           if (_editing)
             Positioned(
-              right: 20,
+              right: 24,
               bottom: 28 + MediaQuery.viewInsetsOf(context).bottom,
-              child: FloatingActionButton.extended(
-                onPressed: _saveEdit,
-                icon: const Icon(LucideIcons.save, size: 18),
-                label: const Text('保存'),
+              child: TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0, end: 1),
+                duration: const Duration(milliseconds: 280),
+                curve: Curves.easeOutBack,
+                builder: (context, v, child) => Transform.scale(
+                  scale: 0.6 + 0.4 * v,
+                  child: Opacity(opacity: v.clamp(0.0, 1.0), child: child),
+                ),
+                child: FloatingActionButton.extended(
+                  onPressed: _saveEdit,
+                  elevation: 3,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  icon: const Icon(LucideIcons.save, size: 18),
+                  label: const Text(
+                    '保存',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
               ),
             ),
         ],
@@ -917,12 +1006,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Widget _buildReaderList() {
     final style = _bodyStyle(context);
     final centerKey = ValueKey<String>('reader-forward-$_listGen');
-    const horizontal = EdgeInsets.symmetric(horizontal: 18);
     return Padding(
       padding: EdgeInsets.only(top: _viewportTopInset),
       child: LayoutBuilder(
         builder: (context, constraints) {
           final width = constraints.maxWidth;
+          final horizontal = _columnPadding(width);
           final previous = _lastListWidth;
           _lastListWidth = width;
           final anchor = _lastAnchor;
@@ -934,49 +1023,187 @@ class _ReaderScreenState extends State<ReaderScreen> {
               if (mounted) unawaited(_restoreAnchor(anchor));
             });
           }
-          return CustomScrollView(
-            controller: _scroll,
-            center: centerKey,
-            slivers: [
-              SliverPadding(
-                key: ValueKey<String>('reader-backward-$_listGen'),
-                padding: horizontal,
-                sliver: SliverList(
-                  delegate: SliverChildBuilderDelegate(
-                    (context, k) => _buildChapterBlock(
-                      chapterIndex: _anchorChapter - 1 - k,
-                      style: style,
+          // Text softly dissolves at the top edge instead of a hard cut; a
+          // mask (not a colour band) so the background image shows through.
+          return ShaderMask(
+            blendMode: BlendMode.dstIn,
+            shaderCallback: (rect) => LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: const [Color(0x00000000), Color(0xFF000000)],
+              stops: [0, (18 / rect.height).clamp(0.0, 1.0)],
+            ).createShader(rect),
+            child: CustomScrollView(
+              controller: _scroll,
+              center: centerKey,
+              slivers: [
+                SliverPadding(
+                  key: ValueKey<String>('reader-backward-$_listGen'),
+                  padding: horizontal,
+                  sliver: SliverList(
+                    delegate: SliverChildBuilderDelegate(
+                      (context, k) => _buildChapterBlock(
+                        chapterIndex: _anchorChapter - 1 - k,
+                        style: style,
+                      ),
+                      childCount: _anchorChapter - _firstLoaded,
                     ),
-                    childCount: _anchorChapter - _firstLoaded,
                   ),
                 ),
-              ),
-              SliverPadding(
-                key: centerKey,
-                padding: horizontal,
-                sliver: SliverList(
-                  delegate: SliverChildBuilderDelegate(
-                    (context, k) => _buildChapterBlock(
-                      chapterIndex: _anchorChapter + k,
-                      style: style,
+                SliverPadding(
+                  key: centerKey,
+                  padding: horizontal,
+                  sliver: SliverList(
+                    delegate: SliverChildBuilderDelegate(
+                      (context, k) => _buildChapterBlock(
+                        chapterIndex: _anchorChapter + k,
+                        style: style,
+                      ),
+                      childCount: _endLoaded - _anchorChapter,
                     ),
-                    childCount: _endLoaded - _anchorChapter,
                   ),
                 ),
-              ),
-              SliverToBoxAdapter(
-                child: _endLoaded < _index.length
-                    ? const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 24),
-                        child: Center(
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                      )
-                    : const SizedBox(height: 48),
-              ),
-            ],
+                SliverToBoxAdapter(
+                  child: _endLoaded < _index.length
+                      ? const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 24),
+                          child: Center(
+                            child: SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
+                        )
+                      : _buildEndMark(),
+                ),
+              ],
+            ),
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildEndMark() {
+    final muted = OwnReadColors.readerText(_dark).withValues(alpha: 0.4);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 72),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(width: 32, height: 1, color: muted),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Text(
+              '全书完',
+              style: OwnReadType.heading(
+                size: 13,
+                color: muted,
+                letterSpacing: 4,
+              ),
+            ),
+          ),
+          Container(width: 32, height: 1, color: muted),
+        ],
+      ),
+    );
+  }
+
+  /// Book title on the left, current chapter + overall progress on the right,
+  /// with a hairline progress track along the bottom edge.
+  Widget _buildRunningHeader() {
+    final top = MediaQuery.paddingOf(context).top;
+    final ink = OwnReadColors.readerText(_dark);
+    final muted = ink.withValues(alpha: 0.5);
+    return Positioned(
+      left: 0,
+      right: 0,
+      top: 0,
+      height: top + _headerHeight,
+      // Transparent: nothing scrolls under it (the list starts below), so the
+      // page background continues behind the header.
+      child: IgnorePointer(
+        child: SizedBox.expand(
+          child: Padding(
+            padding: EdgeInsets.only(top: top),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final pad = _columnPadding(constraints.maxWidth);
+                return Padding(
+                  padding: pad,
+                  child: ValueListenableBuilder<ReadingAnchor?>(
+                    valueListenable: _anchorNotifier,
+                    builder: (context, anchor, _) {
+                      final chapter = anchor?.chapter ?? _anchorChapter;
+                      final total = _index.length;
+                      final progress = total == 0
+                          ? 0.0
+                          : ((chapter + (anchor?.fraction ?? 0)) / total).clamp(
+                              0.0,
+                              1.0,
+                            );
+                      final chapterTitle = _index[chapter]?.title ?? '';
+                      final style = TextStyle(
+                        color: muted,
+                        fontSize: 12,
+                        letterSpacing: 0.5,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      );
+                      return Column(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  _meta?.title ?? '',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: style,
+                                ),
+                              ),
+                              const SizedBox(width: 16),
+                              _HeaderClock(style: style),
+                              const SizedBox(width: 16),
+                              Expanded(
+                                child: Text(
+                                  '$chapterTitle  ·  ${(progress * 100).toStringAsFixed(1)}%',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.end,
+                                  style: style,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Stack(
+                            children: [
+                              Container(
+                                height: 1,
+                                color: ink.withValues(alpha: 0.08),
+                              ),
+                              FractionallySizedBox(
+                                widthFactor: progress,
+                                child: Container(
+                                  height: 1,
+                                  color: OwnReadAccent.of(
+                                    context,
+                                  ).withValues(alpha: 0.7),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -992,23 +1219,37 @@ class _ReaderScreenState extends State<ReaderScreen> {
     return KeyedSubtree(
       key: _keyFor(chapterIndex),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          SizedBox(height: _chapterGap * 0.6),
           Text(
             entry?.title ?? '第${chapterIndex + 1}章',
-            style: style.copyWith(
-              fontSize: _reading.fontSize + 4,
-              fontWeight: FontWeight.w700,
-              color: OwnReadColors.orange,
+            textAlign: TextAlign.center,
+            style: OwnReadType.heading(
+              size: _reading.fontSize + 6,
+              color: style.color,
+              height: 1.4,
+              letterSpacing: 1.5,
             ),
           ),
-          SizedBox(height: _chapterGap * 0.5),
+          SizedBox(height: _chapterGap * 0.45),
+          Center(
+            child: Container(
+              width: 28,
+              height: 2,
+              decoration: BoxDecoration(
+                color: OwnReadAccent.of(context).withValues(alpha: 0.8),
+                borderRadius: BorderRadius.circular(99),
+              ),
+            ),
+          ),
+          SizedBox(height: _chapterGap * 0.9),
           Text(
-            _displayBody(text),
+            _display(chapterIndex, text).text,
             key: _bodyKeyFor(chapterIndex),
             style: style,
           ),
-          SizedBox(height: _chapterGap),
+          SizedBox(height: _chapterGap * 1.5),
         ],
       ),
     );
@@ -1018,6 +1259,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final cs = ShadTheme.of(context).colorScheme;
     final style = _bodyStyle(context);
     final keyboard = MediaQuery.viewInsetsOf(context).bottom;
+    final ink = OwnReadColors.readerText(_dark);
     return Padding(
       padding: EdgeInsets.only(bottom: keyboard),
       child: SafeArea(
@@ -1025,49 +1267,115 @@ class _ReaderScreenState extends State<ReaderScreen> {
           children: [
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              color: OwnReadColors.orange.withValues(alpha: 0.15),
+              height: 48,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              decoration: BoxDecoration(
+                color: OwnReadAccent.of(
+                  context,
+                ).withValues(alpha: _dark ? 0.12 : 0.08),
+                border: Border(
+                  bottom: BorderSide(
+                    color: OwnReadAccent.of(context).withValues(alpha: 0.25),
+                  ),
+                ),
+              ),
               child: Row(
                 children: [
-                  TextButton(
+                  TextButton.icon(
                     onPressed: () =>
                         _exitEditAndRestoreScroll(keepEditedText: false),
-                    child: Text('取消', style: TextStyle(color: cs.foreground)),
+                    icon: Icon(LucideIcons.x, size: 16, color: cs.foreground),
+                    label: Text('取消', style: TextStyle(color: cs.foreground)),
                   ),
                   Expanded(
-                    child: Text(
-                      '编辑 · ${_index[_editingChapter ?? 0]?.title ?? ''}',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                        color: cs.foreground,
-                      ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          LucideIcons.pencilLine,
+                          size: 14,
+                          color: OwnReadAccent.of(context),
+                        ),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            '编辑 · ${_index[_editingChapter ?? 0]?.title ?? ''}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              color: ink,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(width: 64),
+                  const SizedBox(width: 88),
                 ],
               ),
             ),
             Expanded(
-              child: TextField(
-                key: _editorFieldKey,
-                controller: _editController,
-                focusNode: _editFocus,
-                scrollController: _editScroll,
-                maxLines: null,
-                expands: true,
-                style: style,
-                cursorColor: OwnReadColors.orange,
-                decoration: const InputDecoration(
-                  border: InputBorder.none,
-                  contentPadding: EdgeInsets.all(18),
-                ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final side = _columnPadding(constraints.maxWidth).left;
+                  return TextField(
+                    key: _editorFieldKey,
+                    controller: _editController,
+                    focusNode: _editFocus,
+                    scrollController: _editScroll,
+                    maxLines: null,
+                    expands: true,
+                    style: style,
+                    cursorColor: OwnReadAccent.of(context),
+                    decoration: InputDecoration(
+                      border: InputBorder.none,
+                      contentPadding: EdgeInsets.fromLTRB(side, 20, side, 96),
+                    ),
+                  );
+                },
               ),
             ),
           ],
         ),
       ),
     );
+  }
+}
+
+/// Current date and time in the reading header; ticks on its own so the page
+/// itself never rebuilds for it.
+class _HeaderClock extends StatefulWidget {
+  const _HeaderClock({required this.style});
+
+  final TextStyle style;
+
+  @override
+  State<_HeaderClock> createState() => _HeaderClockState();
+}
+
+class _HeaderClockState extends State<_HeaderClock> {
+  static final _format = DateFormat('yyyy-MM-dd HH:mm:ss');
+  late DateTime _now = DateTime.now();
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _now = DateTime.now());
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(_format.format(_now), maxLines: 1, style: widget.style);
   }
 }
 

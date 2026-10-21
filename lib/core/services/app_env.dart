@@ -22,7 +22,12 @@ class AppEnv {
       Duration(seconds: _positiveInt(_unlockKey, 3));
 
   static int _positiveInt(String key, int fallback) {
-    final raw = dotenv.maybeGet(key);
+    String? raw;
+    try {
+      raw = dotenv.maybeGet(key);
+    } catch (_) {
+      // Not loaded yet (tests, missing asset): use the default.
+    }
     final parsed = int.tryParse(raw?.trim() ?? '');
     if (parsed == null || parsed <= 0) return fallback;
     return parsed;

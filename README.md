@@ -9,7 +9,8 @@
 - 书架：排序、查找、删除（确认）、改名；显示章节数、总字数、阅读进度条、修改字数
 - 点击进入阅读并跳转上次阅读位置
 - 无限滚动阅读，预加载上一章 / 下一章
-- 单击呼出侧栏（返回 / 查找替换 / 章节列表）；书架右上角「设置」可调淡色·暗色 / 字号 / 行距
+- 阅读时隐藏 TXT 中的空行（仅显示层处理，不改动文件；编辑器仍显示原文）
+- 单击呼出侧栏（返回 / 查找替换 / 章节列表）；书架右上角「设置」可调淡色·暗色 / 主题颜色 / 阅读背景 / 字体 / 字号 / 行距（「主题」「排版」分组，默认折叠）/ 自动锁屏开关
 - 双击进入就地编辑，右下角「保存」写回本地文件
 - 查找替换与章节编辑均写入修改历史
 
@@ -79,7 +80,25 @@ test/                # 测试
 
 ### 字体
 
-阅读正文字体固定为 **微软雅黑**（`Microsoft YaHei`），并设置平台回退：`PingFang SC` / `Noto Sans CJK SC` / `sans-serif`。未安装雅黑的系统会使用回退字体。
+全应用文字（书架、设置、侧栏、阅读正文、编辑器等）统一使用「设置 → 字体」所选字体（`ReadingFont`），字体文件内置于 `assets/fonts/`（来源与授权见 [assets/fonts/LICENSES.md](./assets/fonts/LICENSES.md)）：
+
+| 选项 | 字体 |
+|------|------|
+| 思源黑体 | Noto Sans CJK SC |
+| 鸿蒙黑体 | HarmonyOS Sans SC |
+| 霞鹜975圆体 | LXGW 975 Yuan SC |
+| 寒蝉全圆体（默认） | Chill Round F |
+| 阿里妈妈方圆体 | Alimama FangYuanTi VF（可变字体，字重自动映射 `wght` 轴） |
+
+缺字时回退：`Microsoft YaHei` / `PingFang SC` / `Noto Sans CJK SC` / `sans-serif`。
+
+## 阅读背景
+
+「设置 → 阅读背景」：纯色、宣纸（梅）、竹影、海波、星河、樱落（默认宣纸）。每种背景各有淡色 / 暗色两张 1024px 无缝平铺图（`assets/backgrounds/{name}_{light|dark}.jpg`，以 2 倍缩放显示），由脚本生成：
+
+```bash
+swift tool/gen_backgrounds.swift
+```
 
 ## 图标
 
@@ -127,7 +146,8 @@ PRIVACY_UNLOCK_HOLD_SECONDS=3
 ```
 
 - `PRIVACY_IDLE_SECONDS`：无操作多久后显示空白蒙版（秒）
-- `PRIVACY_UNLOCK_HOLD_SECONDS`：长按多久解除蒙版（秒）
+- `PRIVACY_UNLOCK_HOLD_SECONDS`：长按蒙版中央的空盒图案多久解除蒙版（秒）；长按其他位置无效
+- 「设置 → 自动锁屏」可关闭此功能（默认开启）；关闭后既不闲置锁屏，也不在切到后台时遮盖
 
 修改后需**完全重启**应用（热重载不会重新加载 `.env`）。可参考 `.env.example`。
 

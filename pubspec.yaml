@@ -37,6 +37,25 @@ flutter:
   assets:
     - .env
     - assets/icon/app_icon.png
+    - assets/backgrounds/
+  # Reading fonts (see ReadingFont). Regular weight only; licences in
+  # assets/fonts/LICENSES.md.
+  fonts:
+    - family: NotoSansSC
+      fonts:
+        - asset: assets/fonts/NotoSansCJKsc-Regular.otf
+    - family: HarmonyOSSansSC
+      fonts:
+        - asset: assets/fonts/HarmonyOS_Sans_SC_Regular.ttf
+    - family: LXGW975YuanSC
+      fonts:
+        - asset: assets/fonts/LXGW975YuanSC-400W.ttf
+    - family: ChillRoundF
+      fonts:
+        - asset: assets/fonts/ChillRoundF.ttf
+    - family: AlimamaFangYuanTi
+      fonts:
+        - asset: assets/fonts/AlimamaFangYuanTiVF.ttf
 
 flutter_launcher_icons:
   android: true
