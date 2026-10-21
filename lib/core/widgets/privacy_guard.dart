@@ -209,7 +209,7 @@ class _PrivacyGuardState extends State<PrivacyGuard>
         child: Stack(
           fit: StackFit.expand,
           children: [
-            widget.child,
+            PrivacyLockScope(locked: _locked, child: widget.child),
             if (_locked)
               Positioned.fill(
                 child: _EmptyCover(unlockTargetKey: _unlockTargetKey),
@@ -346,4 +346,20 @@ class _EmptyTrayPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_EmptyTrayPainter old) => old.ink != ink;
+}
+
+/// Lets local media pause immediately when the privacy cover appears.
+class PrivacyLockScope extends InheritedWidget {
+  const PrivacyLockScope({
+    super.key,
+    required this.locked,
+    required super.child,
+  });
+  final bool locked;
+  static bool isLocked(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<PrivacyLockScope>()?.locked ??
+      false;
+  @override
+  bool updateShouldNotify(PrivacyLockScope oldWidget) =>
+      locked != oldWidget.locked;
 }

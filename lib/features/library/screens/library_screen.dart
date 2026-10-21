@@ -13,6 +13,8 @@ import '../../../core/services/app_settings.dart';
 import '../../../core/services/library_controller.dart';
 import '../../../core/services/txt_file_decoder.dart';
 import '../../../core/storage/novel_repository.dart';
+import '../../../core/storage/gallery_repository.dart';
+import '../../gallery/screens/gallery_screen.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/motion.dart';
 import '../../reader/screens/reader_screen.dart';
@@ -358,6 +360,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     onSort: _setSort,
                     onImport: _import,
                     onSettings: _openSettings,
+                    onGallery: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => GalleryScreen(
+                          repository: GalleryRepository(
+                            root: Directory(
+                              p.join(
+                                widget.repository.libraryFile.parent.path,
+                                'gallery',
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -472,6 +488,7 @@ class _LibraryHeader extends StatelessWidget {
     required this.onSort,
     required this.onImport,
     required this.onSettings,
+    required this.onGallery,
   });
 
   final bool wide;
@@ -481,6 +498,7 @@ class _LibraryHeader extends StatelessWidget {
   final ValueChanged<NovelSortBy> onSort;
   final VoidCallback onImport;
   final VoidCallback onSettings;
+  final VoidCallback onGallery;
 
   @override
   Widget build(BuildContext context) {
@@ -522,6 +540,12 @@ class _LibraryHeader extends StatelessWidget {
     final actions = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
+        _HeaderIcon(
+          icon: Icons.photo_library_outlined,
+          tooltip: '图库',
+          onTap: onGallery,
+        ),
+        const SizedBox(width: 6),
         PopupMenuButton<NovelSortBy>(
           tooltip: '排序',
           position: PopupMenuPosition.under,
